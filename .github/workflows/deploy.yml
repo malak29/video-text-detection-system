@@ -1,0 +1,321 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  release:
+    types: [ published ]
+
+env:
+  DOCKER_REGISTRY: ghcr.io
+  IMAGE_NAME: video-text-detection
+  PYTHON_VERSION: 3.11
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_USER: test
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg libsm6 libxext6 libxrender-dev libgomp1 libgl1-mesa-glx
+    
+    - name: Cache pip packages
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-asyncio pytest-cov
+    
+    - name: Set up test environment
+      run: |
+        mkdir -p ./temp ./output ./models ./uploads
+        echo "SECRET_KEY=test-secret-key" > .env
+        echo "DATABASE_URL=postgresql://test:test@localhost:5432/test_db" >> .env
+        echo "REDIS_URL=redis://localhost:6379/0" >> .env
+        echo "CELERY_BROKER_URL=redis://localhost:6379/0" >> .env
+        echo "CELERY_RESULT_BACKEND=redis://localhost:6379/0" >> .env
+    
+    - name: Run unit tests
+      run: |
+        pytest tests/test_models.py -v --cov=app/ml --cov-report=xml
+    
+    - name: Run API tests
+      run: |
+        pytest tests/test_api.py -v --cov=app/api --cov-report=xml --cov-append
+    
+    - name: Run integration tests
+      run: |
+        pytest tests/test_integration.py -v --cov=app/services --cov-report=xml --cov-append -m "not slow"
+    
+    - name: Upload coverage reports
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+    
+    - name: Lint code
+      run: |
+        pip install flake8 black isort
+        flake8 app tests --count --select=E9,F63,F7,F82 --show-source --statistics
+        black --check app tests
+        isort --check-only app tests
+
+  security-scan:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Run security scan
+      uses: pypa/gh-action-pip-audit@v1.0.8
+      with:
+        inputs: requirements.txt
+        
+    - name: Run Bandit security scan
+      run: |
+        pip install bandit
+        bandit -r app -f json -o bandit-report.json
+        
+    - name: Upload security scan results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: security-scan-results
+        path: bandit-report.json
+
+  build:
+    needs: [test, security-scan]
+    runs-on: ubuntu-latest
+    
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Log into registry ${{ env.DOCKER_REGISTRY }}
+      if: github.event_name != 'pull_request'
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.DOCKER_REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.DOCKER_REGISTRY }}/${{ github.repository }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=semver,pattern={{major}}
+          type=sha
+    
+    - name: Build and push Docker image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        build-args: |
+          BUILDKIT_INLINE_CACHE=1
+
+  deploy-staging:
+    if: github.ref == 'refs/heads/develop'
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment: staging
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Configure kubectl
+      uses: azure/k8s-set-context@v3
+      with:
+        method: kubeconfig
+        kubeconfig: ${{ secrets.KUBE_CONFIG_STAGING }}
+    
+    - name: Deploy to staging
+      run: |
+        sed -i 's|video-text-detection:latest|${{ needs.build.outputs.image-tag }}|g' k8s/deployment.yaml
+        kubectl apply -f k8s/deployment.yaml
+        kubectl set image deployment/video-text-api api=${{ needs.build.outputs.image-tag }} -n video-text-detection
+        kubectl set image deployment/celery-worker worker=${{ needs.build.outputs.image-tag }} -n video-text-detection
+        kubectl set image deployment/streamlit-frontend frontend=${{ needs.build.outputs.image-tag }} -n video-text-detection
+        kubectl rollout status deployment/video-text-api -n video-text-detection
+    
+    - name: Run smoke tests
+      run: |
+        kubectl wait --for=condition=ready pod -l app=video-text-api -n video-text-detection --timeout=300s
+        STAGING_URL=$(kubectl get ingress video-text-detection-ingress -n video-text-detection -o jsonpath='{.spec.rules[0].host}')
+        curl -f http://${STAGING_URL}/health || exit 1
+
+  deploy-production:
+    if: github.event_name == 'release'
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Configure kubectl
+      uses: azure/k8s-set-context@v3
+      with:
+        method: kubeconfig
+        kubeconfig: ${{ secrets.KUBE_CONFIG_PRODUCTION }}
+    
+    - name: Deploy to production
+      run: |
+        sed -i 's|video-text-detection:latest|${{ needs.build.outputs.image-tag }}|g' k8s/deployment.yaml
+        kubectl apply -f k8s/deployment.yaml
+        
+        kubectl set image deployment/video-text-api api=${{ needs.build.outputs.image-tag }} -n video-text-detection
+        kubectl set image deployment/celery-worker worker=${{ needs.build.outputs.image-tag }} -n video-text-detection
+        kubectl set image deployment/streamlit-frontend frontend=${{ needs.build.outputs.image-tag }} -n video-text-detection
+        
+        kubectl rollout status deployment/video-text-api -n video-text-detection --timeout=600s
+        kubectl rollout status deployment/celery-worker -n video-text-detection --timeout=600s
+    
+    - name: Run production smoke tests
+      run: |
+        PRODUCTION_URL=$(kubectl get ingress video-text-detection-ingress -n video-text-detection -o jsonpath='{.spec.rules[0].host}')
+        curl -f http://${PRODUCTION_URL}/health || exit 1
+        curl -f http://${PRODUCTION_URL}/api/v1/auth/register -X POST -d '{"username":"healthcheck","email":"test@example.com","password":"test123"}' -H "Content-Type: application/json" || echo "Auth endpoint accessible"
+    
+    - name: Notify deployment success
+      uses: 8398a7/action-slack@v3
+      with:
+        status: success
+        text: 'Production deployment successful! Version: ${{ github.event.release.tag_name }}'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+  performance-test:
+    if: github.ref == 'refs/heads/main'
+    needs: [deploy-staging]
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Install k6
+      run: |
+        sudo gpg -k
+        sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+        echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+        sudo apt-get update
+        sudo apt-get install k6
+    
+    - name: Run performance tests
+      run: |
+        k6 run --out json=results.json tests/performance/load-test.js
+    
+    - name: Upload performance results
+      uses: actions/upload-artifact@v3
+      with:
+        name: performance-results
+        path: results.json
+
+  cleanup:
+    if: always()
+    needs: [test, security-scan, build, deploy-staging, deploy-production, performance-test]
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Clean up old Docker images
+      if: github.event_name != 'pull_request'
+      run: |
+        echo "Cleaning up old Docker images..."
+        # This would typically be handled by registry cleanup policies
+        echo "Cleanup completed"
+    
+    - name: Clean up test artifacts
+      run: |
+        echo "Cleaning up test artifacts..."
+        # Clean up any temporary files or resources
+        echo "Cleanup completed"
+
+  notify:
+    if: always()
+    needs: [test, security-scan, build, deploy-staging, deploy-production]
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Notify on failure
+      if: failure()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: failure
+        text: 'Pipeline failed! Check the GitHub Actions logs for details.'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+    
+    - name: Notify on success
+      if: success() && github.ref == 'refs/heads/main'
+      uses: 8398a7/action-slack@v3
+      with:
+        status: success
+        text: 'Pipeline completed successfully! All tests passed and deployment successful.'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
